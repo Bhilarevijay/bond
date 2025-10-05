@@ -1,495 +1,1376 @@
-import streamlit as st
-import pandas as pd
-import folium
-from streamlit_folium import st_folium
+from flask import Flask, render_template, request, jsonify, redirect, url_for, flash, session
+from flask_sqlalchemy import SQLAlchemy
+from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
+from werkzeug.utils import secure_filename
+from werkzeug.security import generate_password_hash, check_password_hash
 import os
-import numpy as np
-from sklearn.cluster import KMeans
-from datetime import datetime
+import uuid
+from datetime import datetime, timedelta
+import requests
+from PIL import Image
+import json
+import math
+from collections import defaultdict, Counter
+import statistics
+import cloudinary
+import cloudinary.uploader
+import cloudinary.api
+from cloudinary.utils import cloudinary_url
 
-# --- Imports and Initial Error Checking ---
-# This block ensures the app provides a helpful error if models haven't been trained
-try:
-    # Attempt to import prediction functions and helper
-    from predictor import predict_initial_case, refine_location_with_sightings, haversine
-except ImportError:
-    st.error("FATAL ERROR: The 'predictor.py' file was not found. Please ensure it is in the same directory.")
-    st.stop()
-except Exception as e:
-    # This catches errors during model loading inside predictor.py
-    st.error(f"FATAL ERROR on startup: Could not load models from predictor.py. Have you run train.py successfully? Details: {e}")
-    st.stop()
+from config import Config
 
-# --- Configuration ---
-RANDOM_SEED = 42
-DATASET_PATH = "sachet_main_cases_2M.csv" # Ensure this points to the generated dataset
+# Initialize Flask app
+app = Flask(__name__)
+app.config.from_object(Config)
 
-st.set_page_config(page_title="Sachet: Advanced Alert System", layout="wide")
-st.title("🔔 Sachet: Advanced Predictive Alert System")
+# Get the base directory
+basedir = os.path.abspath(os.path.dirname(__file__))
 
-@st.cache_data
-def load_data(path):
-    """Loads historical case data for generating secondary hotspots."""
-    if os.path.exists(path):
-        # Load only necessary columns for efficiency
-        return pd.read_csv(path, usecols=['case_id', 'abduction_time', 'abductor_relation', 'region_type', 'recovered', 'recovery_latitude', 'recovery_longitude'])
-    return None
+# Ensure upload directories exist for local development
+os.makedirs(os.path.join(app.config['UPLOAD_FOLDER'], 'photos'), exist_ok=True)
+os.makedirs(os.path.join(app.config['UPLOAD_FOLDER'], 'audio'), exist_ok=True)
 
-df = load_data(DATASET_PATH)
-if df is None:
-    st.error(f"FATAL ERROR: Dataset '{DATASET_PATH}' not found. Please run your data generator script first.")
-    st.stop()
+# Create error templates directory
+os.makedirs(os.path.join(basedir, 'templates', 'errors'), exist_ok=True)
 
-# --- Initialize Session State ---
-# This ensures variables persist between user interactions, preventing UI bugs.
-if 'prediction' not in st.session_state: st.session_state.prediction = None
-if 'sightings' not in st.session_state: st.session_state.sightings = []
-if 'refined_location' not in st.session_state: st.session_state.refined_location = None
-if 'initial_case_input' not in st.session_state: st.session_state.initial_case_input = None
-if 'map_key' not in st.session_state: st.session_state.map_key = 'initial_map'
+# Initialize extensions
+db = SQLAlchemy(app)
+login_manager = LoginManager()
+login_manager.init_app(app)
+login_manager.login_view = 'admin_login'
 
-# --- Sidebar: Input Form ---
-st.sidebar.header("Enter Case Details")
-age = st.sidebar.slider("Child Age", 1, 18, 9, key="age")
-gender = st.sidebar.selectbox("Child Gender", ["M", "F"], key="gender")
-hour = st.sidebar.slider("Abduction Time (24h format)", 0, 23, 17, key="hour")
-dow = st.sidebar.slider("Day of Week (0=Mon, 6=Sun)", 0, 6, 4, key="dow")
-st.sidebar.subheader("Location & Context")
-# Default coordinates set to Mumbai (Maharashtra capital)
-lat = st.sidebar.number_input("Last Seen Latitude", value=19.0760, format="%.4f", key="lat")
-lon = st.sidebar.number_input("Last Seen Longitude", value=72.8777, format="%.4f", key="lon")
-region_type = st.sidebar.selectbox("Region Type", df['region_type'].unique(), key="region")
-pop_density = st.sidebar.number_input("Population Density", value=20000, min_value=10, key="pop")
-transport_hub = st.sidebar.selectbox("Major Transport Hub Nearby?", [1, 0], format_func=lambda x: 'Yes' if x==1 else 'No', key="hub")
-st.sidebar.subheader("Abductor Information")
-relation = st.sidebar.selectbox("Abductor Relation", df['abductor_relation'].unique(), key="relation")
+# In-memory tracking for failed admin login attempts and lockouts
+FAILED_ADMIN_LOGINS = {}
 
-if st.sidebar.button("Predict Initial Case", type="primary", use_container_width=True):
-    # 1. Collect all input features
-    case_input = {
-        'child_age':age, 'child_gender':gender, 'abduction_time':hour, 'abductor_relation':relation, 
-        'latitude':lat, 'longitude':lon, 'day_of_week':dow, 'region_type':region_type, 
-        'population_density':pop_density, 'transport_hub_nearby':transport_hub
+def _get_client_ip():
+    try:
+        # Respect common proxy headers if present
+        forwarded_for = request.headers.get('X-Forwarded-For', '')
+        if forwarded_for:
+            return forwarded_for.split(',')[0].strip()
+    except Exception:
+        pass
+    return request.remote_addr or 'unknown'
+
+def _is_locked_out(key: str) -> bool:
+    record = FAILED_ADMIN_LOGINS.get(key)
+    if not record:
+        return False
+    lock_until = record.get('lock_until')
+    if lock_until and datetime.utcnow() < lock_until:
+        return True
+    # Expire lock if past time
+    if lock_until and datetime.utcnow() >= lock_until:
+        FAILED_ADMIN_LOGINS.pop(key, None)
+    return False
+
+def _register_failed_attempt(key: str):
+    settings_max = app.config.get('ADMIN_MAX_FAILED_ATTEMPTS', 5)
+    lock_minutes = app.config.get('ADMIN_LOCKOUT_MINUTES', 15)
+    record = FAILED_ADMIN_LOGINS.get(key, {'count': 0, 'lock_until': None})
+    record['count'] = record.get('count', 0) + 1
+    if record['count'] >= int(settings_max):
+        record['lock_until'] = datetime.utcnow() + timedelta(minutes=int(lock_minutes))
+    FAILED_ADMIN_LOGINS[key] = record
+
+def _reset_failed_attempts(key: str):
+    FAILED_ADMIN_LOGINS.pop(key, None)
+
+# Return 404 instead of redirect when unauthorized, to hide admin routes
+@login_manager.unauthorized_handler
+def handle_unauthorized():
+    if request.path.startswith('/admin'):
+        return render_template('errors/404.html'), 404
+    return render_template('errors/404.html'), 404
+
+@app.before_request
+def enforce_admin_scope_logout_on_public_pages():
+    try:
+        path = request.path or ''
+        # If logged in and navigating explicitly to the public home page, log out
+        if current_user.is_authenticated:
+            # Consider both root path and the named endpoint for index
+            if path == '/' or request.endpoint == 'index':
+                logout_user()
+                return None
+    except Exception:
+        # Fail closed is not necessary here; allow request to proceed
+        return None
+
+@app.before_request
+def guard_admin_routes():
+    try:
+        path = request.path or ''
+        if path.startswith('/admin'):
+            # Allow reaching the login endpoint (token gate will still apply inside)
+            if request.endpoint == 'admin_login':
+                return None
+            if not current_user.is_authenticated:
+                return render_template('errors/404.html'), 404
+    except Exception:
+        # On any error, fail closed
+        return render_template('errors/404.html'), 404
+
+# Initialize Cloudinary
+def init_cloudinary():
+    # Prefer single-URL configuration if provided (e.g., CLOUDINARY_URL=cloudinary://api_key:api_secret@cloud_name)
+    cloudinary_url_env = os.environ.get('CLOUDINARY_URL')
+    if cloudinary_url_env:
+        try:
+            cloudinary.config(
+                cloudinary_url=cloudinary_url_env,
+                secure=True
+            )
+            print("✅ Cloudinary configured via CLOUDINARY_URL")
+            return True
+        except Exception as e:
+            print(f"⚠️ Failed to configure Cloudinary via CLOUDINARY_URL: {str(e)}")
+
+    cloud_name = app.config.get('CLOUDINARY_CLOUD_NAME')
+    api_key = app.config.get('CLOUDINARY_API_KEY')
+    api_secret = app.config.get('CLOUDINARY_API_SECRET')
+    if cloud_name and api_key and api_secret:
+        cloudinary.config(
+            cloud_name=cloud_name,
+            api_key=api_key,
+            api_secret=api_secret,
+            secure=True
+        )
+        print("✅ Cloudinary configured successfully")
+        return True
+    else:
+        missing = []
+        if not cloud_name:
+            missing.append('CLOUDINARY_CLOUD_NAME')
+        if not api_key:
+            missing.append('CLOUDINARY_API_KEY')
+        if not api_secret:
+            missing.append('CLOUDINARY_API_SECRET')
+        print(f"⚠️ Cloudinary not fully configured (missing: {', '.join(missing)}) - using local storage")
+        return False
+
+CLOUDINARY_ENABLED = init_cloudinary()
+
+# PREDEFINED DEMO PHONE NUMBERS (Replace with your verified Twilio numbers)
+DEMO_PHONE_NUMBERS = [
+    '+919960846194',
+    '‭+917758926422‬',
+    '+919920846982',
+    '+919370831887',
+    '+917387350049',
+    '+917028826639'
+]
+
+# Area-wise keyword filters and number routing
+# Keys are canonical area ids, values are keyword lists to match in free-text locations
+AREA_KEYWORDS = {
+    'magarpatta': ['magarpatta'],
+    'mit_loni': ['mit loni', 'loni', 'mit'],
+    'pcmc': ['pcmc', 'pimpri', 'chinchwad', 'pimpri-chinchwad'],
+    'koregaon_park': ['koregaon park', 'kp'],
+    'seasons_mall': ["season's mall", 'seasons mall', 'season mall', 'seasons'],
+    'pune_airport': ['pune airport', 'lohegaon', 'lohgaon', 'pnq']
+}
+
+# Assign one phone number per area in declaration order using DEMO_PHONE_NUMBERS
+def build_area_number_mapping():
+    area_ids = list(AREA_KEYWORDS.keys())
+    mapping = {}
+    for idx, area_id in enumerate(area_ids):
+        try:
+            mapping[area_id] = DEMO_PHONE_NUMBERS[idx]
+        except IndexError:
+            # Fallback: if fewer numbers than areas, reuse the first number
+            mapping[area_id] = DEMO_PHONE_NUMBERS[0] if DEMO_PHONE_NUMBERS else None
+    return mapping
+
+AREA_TO_NUMBER = build_area_number_mapping()
+
+def select_numbers_for_location(location_text):
+    """Return a list of phone numbers to alert based on free-text location.
+
+    Matching is case-insensitive and uses simple substring checks against
+    configured AREA_KEYWORDS. If multiple areas match, all corresponding
+    numbers are returned (de-duplicated). If none match, returns the default
+    DEMO_PHONE_NUMBERS list.
+    """
+    if not location_text:
+        return DEMO_PHONE_NUMBERS
+
+    location_lower = location_text.strip().lower()
+    selected_numbers = []
+
+    for area_id, keywords in AREA_KEYWORDS.items():
+        if any(keyword in location_lower for keyword in keywords):
+            # Special-case: demo needs MIT Loni to broadcast to all numbers
+            if area_id == 'mit_loni':
+                return DEMO_PHONE_NUMBERS
+            number = AREA_TO_NUMBER.get(area_id)
+            if number:
+                selected_numbers.append(number)
+
+    # De-duplicate while preserving order
+    seen = set()
+    filtered = []
+    for n in selected_numbers:
+        if n not in seen:
+            seen.add(n)
+            filtered.append(n)
+
+    return filtered if filtered else DEMO_PHONE_NUMBERS
+
+# Initialize Twilio - only when needed
+def get_twilio_client():
+    try:
+        from twilio.rest import Client
+        return Client(app.config['TWILIO_ACCOUNT_SID'], app.config['TWILIO_AUTH_TOKEN'])
+    except Exception as e:
+        print(f"Error creating Twilio client: {str(e)}")
+        return None
+
+# Database Models
+class MissingChild(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    report_id = db.Column(db.String(100), unique=True, nullable=False)
+    name = db.Column(db.String(100), nullable=False)
+    age = db.Column(db.Integer, nullable=False)
+    gender = db.Column(db.String(20), nullable=False)
+    last_seen_location = db.Column(db.String(200), nullable=False)
+    location_subcategory = db.Column(db.String(200))
+    last_seen_lat = db.Column(db.Float)
+    last_seen_lng = db.Column(db.Float)
+    description = db.Column(db.Text, nullable=False)
+    photo_filename = db.Column(db.String(500))  # Increased length for URLs
+    audio_filename = db.Column(db.String(500))  # Increased length for URLs
+    emergency_contact = db.Column(db.String(100))  # Emergency contact phone/email
+    date_reported = db.Column(db.DateTime, default=datetime.utcnow)
+    status = db.Column(db.String(20), default='missing')
+    sightings = db.relationship('Sighting', backref='missing_child', lazy=True)
+
+class Sighting(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    report_id = db.Column(db.String(100), db.ForeignKey('missing_child.report_id'), nullable=False)
+    location = db.Column(db.String(200), nullable=False)
+    latitude = db.Column(db.Float, nullable=False)
+    longitude = db.Column(db.Float, nullable=False)
+    description = db.Column(db.Text)
+    reporter_phone = db.Column(db.String(20))
+    photo_filename = db.Column(db.String(500))  # Optional photo proof for sighting
+    sighting_time = db.Column(db.DateTime, default=datetime.utcnow)
+
+class User(UserMixin, db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(80), unique=True, nullable=False)
+    password_hash = db.Column(db.String(200), nullable=False)
+
+class RiskZone(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    zone_name = db.Column(db.String(200), nullable=False)
+    latitude = db.Column(db.Float, nullable=False)
+    longitude = db.Column(db.Float, nullable=False)
+    radius_km = db.Column(db.Float, default=1.0)
+    risk_score = db.Column(db.Float, default=0.0)
+    incident_count = db.Column(db.Integer, default=0)
+    last_updated = db.Column(db.DateTime, default=datetime.utcnow)
+    is_active = db.Column(db.Boolean, default=True)
+
+class Analytics(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    analysis_type = db.Column(db.String(50), nullable=False)
+    analysis_data = db.Column(db.Text)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    insights = db.Column(db.Text)
+
+@login_manager.user_loader
+def load_user(user_id):
+    return User.query.get(int(user_id))
+
+# Utility Functions
+def allowed_file(filename, allowed_extensions):
+    return '.' in filename and \
+           filename.rsplit('.', 1)[1].lower() in allowed_extensions
+
+def upload_to_cloudinary(file, folder, public_id):
+    """Upload file to Cloudinary"""
+    try:
+        if not CLOUDINARY_ENABLED:
+            return None
+            
+        result = cloudinary.uploader.upload(
+            file,
+            folder=folder,
+            public_id=public_id,
+            overwrite=True,
+            resource_type="auto",
+            transformation=[
+                {'width': 800, 'height': 800, 'crop': 'limit', 'quality': 'auto:good'}
+            ] if folder == 'missing_children/photos' else None
+        )
+        return result['secure_url']
+    except Exception as e:
+        print(f"Cloudinary upload error: {str(e)}")
+        return None
+
+def save_file_locally(file, folder, filename):
+    """Save file to local storage with proper organization"""
+    try:
+        # Create folder if it doesn't exist
+        folder_path = os.path.join(app.config['UPLOAD_FOLDER'], folder)
+        os.makedirs(folder_path, exist_ok=True)
+        
+        # Generate unique filename
+        file_path = os.path.join(folder_path, filename)
+        
+        # Save file
+        file.save(file_path)
+        
+        # For images, optimize them
+        if folder == 'photos' and file.filename.lower().endswith(('.png', '.jpg', '.jpeg', '.gif')):
+            try:
+                with Image.open(file_path) as img:
+                    # Convert to RGB if necessary
+                    if img.mode in ('RGBA', 'LA', 'P'):
+                        img = img.convert('RGB')
+                    
+                    # Resize if too large
+                    img.thumbnail((800, 800), Image.Resampling.LANCZOS)
+
+                    # Save as optimized JPEG and update filename to .jpg
+                    base_name, _ext = os.path.splitext(filename)
+                    optimized_filename = base_name + '.jpg'
+                    optimized_path = os.path.join(folder_path, optimized_filename)
+                    img.save(optimized_path, 'JPEG', quality=85, optimize=True)
+
+                    # Remove original if different
+                    if optimized_path != file_path and os.path.exists(file_path):
+                        try:
+                            os.remove(file_path)
+                        except Exception:
+                            pass
+
+                    filename = optimized_filename
+            except Exception as img_error:
+                print(f"Image optimization error: {str(img_error)}")
+        
+        # Return just the filename for static file access
+        return filename
+    except Exception as e:
+        print(f"Local file save error: {str(e)}")
+        return None
+
+def upload_audio_to_cloudinary(file, public_id):
+    """Upload audio file to Cloudinary"""
+    try:
+        if not CLOUDINARY_ENABLED:
+            return None
+            
+        result = cloudinary.uploader.upload(
+            file,
+            folder='missing_children/audio',
+            public_id=public_id,
+            overwrite=True,
+            resource_type="video"  # Cloudinary uses 'video' for audio files
+        )
+        return result['secure_url']
+    except Exception as e:
+        print(f"Cloudinary audio upload error: {str(e)}")
+        return None
+
+def get_location_coordinates(location_name):
+    """Get coordinates from location name using Nominatim API"""
+    if not location_name:
+        return None, None
+    
+    try:
+        location_encoded = location_name.strip().replace(' ', '+')
+        url = f"https://nominatim.openstreetmap.org/search?format=json&q={location_encoded}&limit=1"
+        
+        headers = {
+            'User-Agent': 'ChildAbductionSystem/1.0 (contact@example.com)'
+        }
+        
+        response = requests.get(url, headers=headers, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        
+        if data and len(data) > 0:
+            lat = float(data[0]['lat'])
+            lng = float(data[0]['lon'])
+            if not app.config['DEBUG']:
+                print(f"Geocoded '{location_name}' to: {lat}, {lng}")
+            return lat, lng
+        else:
+            if not app.config['DEBUG']:
+                print(f"No results found for location: {location_name}")
+            return None, None
+            
+    except Exception as e:
+        if not app.config['DEBUG']:
+            print(f"Geocoding error for '{location_name}': {str(e)}")
+        return None, None
+
+def send_sms_alert(message):
+    """Send SMS alerts to predefined demo phone numbers"""
+    if app.config['DEBUG']:
+        print(f"\n=== SMS DEBUG MODE ===")
+        print(f"Message: {message}")
+        print(f"Would send to: {DEMO_PHONE_NUMBERS}")
+        print("=== END SMS DEBUG ===\n")
+        return len(DEMO_PHONE_NUMBERS)
+    
+    sent_count = 0
+    failed_numbers = []
+    
+    if not app.config.get('TWILIO_ACCOUNT_SID') or not app.config.get('TWILIO_AUTH_TOKEN'):
+        print("❌ Twilio credentials not configured")
+        return 0
+    
+    if not app.config.get('TWILIO_PHONE_NUMBER'):
+        print("❌ Twilio phone number not configured")
+        return 0
+    
+    if not DEMO_PHONE_NUMBERS:
+        print("❌ No demo phone numbers configured")
+        return 0
+    
+    try:
+        twilio_client = get_twilio_client()
+        if not twilio_client:
+            print("❌ Failed to create Twilio client")
+            return 0
+        
+        for i, phone_number in enumerate(DEMO_PHONE_NUMBERS, 1):
+            try:
+                message_obj = twilio_client.messages.create(
+                    body=message,
+                    from_=app.config['TWILIO_PHONE_NUMBER'],
+                    to=phone_number
+                )
+                sent_count += 1
+                
+            except Exception as e:
+                print(f"❌ Failed to send SMS to {phone_number}: {str(e)}")
+                failed_numbers.append(phone_number)
+                
+    except Exception as e:
+        print(f"❌ Twilio client error: {str(e)}")
+    
+    return sent_count
+
+def send_sms_alert_to_numbers(message, phone_numbers):
+    """Send SMS to a specific list of numbers (area-wise routing)."""
+    if app.config['DEBUG']:
+        print(f"\n=== SMS DEBUG MODE (Targeted) ===")
+        print(f"Message: {message}")
+        print(f"Would send to: {phone_numbers}")
+        print("=== END SMS DEBUG ===\n")
+        return len(phone_numbers or [])
+
+    if not phone_numbers:
+        return 0
+
+    if not app.config.get('TWILIO_ACCOUNT_SID') or not app.config.get('TWILIO_AUTH_TOKEN'):
+        print("❌ Twilio credentials not configured")
+        return 0
+    if not app.config.get('TWILIO_PHONE_NUMBER'):
+        print("❌ Twilio phone number not configured")
+        return 0
+
+    sent_count = 0
+    try:
+        twilio_client = get_twilio_client()
+        if not twilio_client:
+            print("❌ Failed to create Twilio client")
+            return 0
+
+        for phone_number in phone_numbers:
+            try:
+                _ = twilio_client.messages.create(
+                    body=message,
+                    from_=app.config['TWILIO_PHONE_NUMBER'],
+                    to=phone_number
+                )
+                sent_count += 1
+            except Exception as e:
+                print(f"❌ Failed to send SMS to {phone_number}: {str(e)}")
+    except Exception as e:
+        print(f"❌ Twilio client error: {str(e)}")
+
+    return sent_count
+
+# Analytics Functions
+def calculate_distance(lat1, lon1, lat2, lon2):
+    """Calculate distance between two points in kilometers"""
+    if not all([lat1, lon1, lat2, lon2]):
+        return float('inf')
+    
+    R = 6371  # Earth's radius in kilometers
+    
+    lat1_rad = math.radians(lat1)
+    lon1_rad = math.radians(lon1)
+    lat2_rad = math.radians(lat2)
+    lon2_rad = math.radians(lon2)
+    
+    dlat = lat2_rad - lat1_rad
+    dlon = lon2_rad - lon1_rad
+    
+    a = math.sin(dlat/2)**2 + math.cos(lat1_rad) * math.cos(lat2_rad) * math.sin(dlon/2)**2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+    
+    return R * c
+
+def analyze_risk_zones():
+    """Analyze historical data to identify high-risk zones"""
+    cases = MissingChild.query.filter(
+        MissingChild.last_seen_lat.isnot(None),
+        MissingChild.last_seen_lng.isnot(None)
+    ).all()
+    
+    if len(cases) < 2:
+        return []
+    
+    zones = []
+    processed = set()
+    
+    for i, case in enumerate(cases):
+        if i in processed:
+            continue
+            
+        zone_cases = [case]
+        processed.add(i)
+        
+        for j, other_case in enumerate(cases[i+1:], i+1):
+            if j in processed:
+                continue
+                
+            distance = calculate_distance(
+                case.last_seen_lat, case.last_seen_lng,
+                other_case.last_seen_lat, other_case.last_seen_lng
+            )
+            
+            if distance <= 2.0:
+                zone_cases.append(other_case)
+                processed.add(j)
+        
+        if len(zone_cases) >= 2:
+            avg_lat = sum(c.last_seen_lat for c in zone_cases) / len(zone_cases)
+            avg_lng = sum(c.last_seen_lng for c in zone_cases) / len(zone_cases)
+            risk_score = calculate_risk_score(zone_cases)
+            zone_name = f"Zone_{len(zones)+1}"
+            
+            zones.append({
+                'name': zone_name,
+                'lat': avg_lat,
+                'lng': avg_lng,
+                'cases': zone_cases,
+                'risk_score': risk_score,
+                'incident_count': len(zone_cases)
+            })
+    
+    # Save to database
+    RiskZone.query.delete()
+    
+    for zone in zones:
+        risk_zone = RiskZone(
+            zone_name=zone['name'],
+            latitude=zone['lat'],
+            longitude=zone['lng'],
+            risk_score=zone['risk_score'],
+            incident_count=zone['incident_count'],
+            radius_km=2.0
+        )
+        db.session.add(risk_zone)
+    
+    db.session.commit()
+    return zones
+
+def calculate_risk_score(cases):
+    """Calculate risk score for a zone based on multiple factors"""
+    if not cases:
+        return 0
+    
+    incident_score = min(len(cases) * 10, 50)
+    
+    now = datetime.utcnow()
+    recency_scores = []
+    
+    for case in cases:
+        days_ago = (now - case.date_reported).days
+        if days_ago <= 30:
+            recency_scores.append(20)
+        elif days_ago <= 90:
+            recency_scores.append(15)
+        elif days_ago <= 365:
+            recency_scores.append(10)
+        else:
+            recency_scores.append(5)
+    
+    recency_score = sum(recency_scores) / len(recency_scores) if recency_scores else 0
+    
+    age_scores = []
+    for case in cases:
+        if case.age <= 5:
+            age_scores.append(15)
+        elif case.age <= 10:
+            age_scores.append(12)
+        elif case.age <= 15:
+            age_scores.append(8)
+        else:
+            age_scores.append(5)
+    
+    age_score = sum(age_scores) / len(age_scores) if age_scores else 0
+    
+    total_score = incident_score + recency_score + age_score
+    return min(total_score, 100)
+
+def analyze_demographic_patterns():
+    """Analyze patterns in demographics"""
+    cases = MissingChild.query.all()
+    
+    if not cases:
+        return {}
+    
+    patterns = {
+        'age_groups': Counter(),
+        'gender_distribution': Counter(),
+        'time_patterns': Counter(),
+        'location_types': Counter(),
+        'recovery_rates': {}
     }
     
-    # 2. Calculate dist_to_nearest_city (Required for Stage 2 static features)
-    CITY_CENTERS = {"Mumbai":(19.0760,72.8777),"Pune":(18.5204,73.8567),"Nagpur":(21.1458,79.0882),"Nashik":(20.0112,73.7909)}
-    dist = min([haversine(lat, lon, c_lat, c_lon) for c_lat, c_lon in CITY_CENTERS.values()]);
-    case_input['dist_to_nearest_city'] = dist
-    
-    # 3. Run Stage 1 Prediction
-    with st.spinner("Running initial prediction using Stage 1 AI..."):
-        st.session_state.initial_case_input = case_input # Save for Stage 2
-        st.session_state.prediction = predict_initial_case(case_input)
-        st.session_state.sightings = [] # Clear old sightings
-        st.session_state.refined_location = None
-        st.session_state.start_time = datetime.now()
-        # Pre-fill sighting inputs with a likely first location
-        st.session_state.s_lat_input = lat + np.random.uniform(-0.1, 0.1)
-        st.session_state.s_lon_input = lon + np.random.uniform(-0.1, 0.1)
-        st.session_state.s_hours_input = 5.0
-        st.session_state.s_text_input = "heading towards major road"
-        st.session_state.map_key = f'map_{datetime.now().timestamp()}'
-
-# --- Sidebar: Live Sightings ---
-st.sidebar.subheader("Live Sightings Management")
-if st.session_state.prediction and st.session_state.prediction['recovered_label'] == 1:
-    s_lat = st.sidebar.number_input("Sighting Latitude", format="%.4f", key="s_lat_input")
-    s_lon = st.sidebar.number_input("Sighting Longitude", format="%.4f", key="s_lon_input")
-    s_text = st.sidebar.text_input("Direction Description", key="s_text_input")
-    s_hours = st.sidebar.number_input("Hours Since Abduction", min_value=0.1, step=0.5, format="%.1f", key="s_hours_input")
-
-    if st.sidebar.button("Add Sighting"):
-        # --- LON CORRECTION LOGIC ---
-        # Automatically fix single-digit longitudes (e.g., 7.8) to the 70s (e.g., 77.8)
-        # as the model data is entirely in Maharashtra (Lon 72 to 80).
-        if s_lon < 70:
-            s_lon += 70
-            st.warning(f"Sighting Longitude corrected from {s_lon-70:.2f} to {s_lon:.4f} for Maharashtra's range.")
-        
-        # Add new sighting and sort by time
-        new_sighting = {'lat': s_lat, 'lon': s_lon, 'direction_text': s_text, 'hours_since': s_hours}
-        st.session_state.sightings.append(new_sighting)
-        st.session_state.sightings.sort(key=lambda s: s['hours_since'])
-        st.sidebar.success("Sighting added! Click 'Refine Prediction' below.")
-        st.session_state.map_key = f'map_{datetime.now().timestamp()}' # Force map redraw
-else:
-    st.sidebar.warning("Predict a case first. If the case is predicted as 'Not Recovered', refinement is disabled.")
-
-# --- Main App Layout ---
-if st.session_state.prediction:
-    pred = st.session_state.prediction
-    risk_map={0:"Low",1:"Medium",2:"High"}
-    alert_map={0:"Internal Monitoring",1:"Local Alert",2:"State-Wide Alert (Amber)"}
-    color_map={0:"green",1:"orange",2:"red"}
-
-    st.header("🚨 Prediction Results")
-    col1,col2=st.columns(2)
-    col1.metric("Risk Level", f"{risk_map.get(pred['risk_label'])} Risk", f"Confidence: {pred['risk_prob']:.1%}")
-    col2.metric("Recommended Alert", alert_map.get(pred['risk_label']))
-
-    st.subheader("Recovery Prediction")
-    colA,colB=st.columns(2)
-    colA.metric("Probability of Recovery", f"{pred['recovered_prob']:.1%}")
-    colB.metric("Est. Recovery Time", f"~{int(pred['recovery_time_hours'])} hours" if pred['recovery_time_hours']>0 else "N/A")
-
-    st.subheader("📍 Predictive Location Analysis")
-    
-    # Initialize Folium Map centered on the last seen location
-    m = folium.Map(location=[lat, lon], zoom_start=8, tiles="OpenStreetMap")
-    folium.Marker([lat, lon], popup="Last Seen Location", icon=folium.Icon(color="blue", icon="info-sign")).add_to(m)
-    folium.Circle(radius=5000, location=[lat,lon], color="#800080", fill=True, fill_opacity=0.1, popup="Initial Search Area").add_to(m)
-
-    # Display Sightings
-    if st.session_state.sightings:
-        st.info(f"{len(st.session_state.sightings)} sighting(s) logged. Use the button below to incorporate them.")
-        
-        # Display sightings table for verification
-        st.markdown("**Logged Sightings (Sorted by Time):**")
-        sightings_df = pd.DataFrame(st.session_state.sightings)
-        st.dataframe(sightings_df.rename(columns={'lat': 'Lat', 'lon': 'Lon', 'hours_since': 'Hours Since', 'direction_text': 'Direction Text'}), use_container_width=True)
-
-        sighting_points = []
-        for s in st.session_state.sightings:
-            # Enhanced sighting popup
-            sighting_popup_text = f"Sighting @ {s['hours_since']:.1f} hrs<br>Direction: {s['direction_text']}"
-            folium.Marker([s['lat'], s['lon']], popup=folium.Popup(sighting_popup_text, max_width=200), icon=folium.Icon(color='orange', icon='eye-open', prefix='fa')).add_to(m)
-            sighting_points.append((s['lat'], s['lon']))
-        if len(sighting_points) > 1:
-            folium.PolyLine(sighting_points, color="orange", weight=2.5, opacity=0.8, popup="Sighting Path").add_to(m)
-
-        # Refinement button
-        if st.button("Refine Prediction with Live Sightings", type="secondary"):
-            with st.spinner("Running Stage 2 AI (Deep Learning Refinement)..."):
-                r_lat, r_lon = refine_location_with_sightings(pred, st.session_state.sightings, st.session_state.initial_case_input)
-                st.session_state.refined_location = (r_lat, r_lon)
-                st.session_state.map_key = f'map_{datetime.now().timestamp()}'
-    
-    # --- Primary Hotspot Determination (Initial or Refined) ---
-    p_lat = st.session_state.refined_location[0] if st.session_state.refined_location else pred['predicted_latitude']
-    p_lon = st.session_state.refined_location[1] if st.session_state.refined_location else pred['predicted_longitude']
-    
-    if p_lat!=0: # Check if a location was actually predicted
-        # Display primary hotspot (initial or refined)
-        if st.session_state.refined_location:
-            p_popup="REFINED Primary Location (LSTM)"; p_icon_color="purple"; p_icon="bullseye"; p_prefix='fa'
-            # Display coordinates in success message for user verification
-            st.success(f"AI refined primary hotspot to: {p_lat:.4f}, {p_lon:.4f}") 
+    for case in cases:
+        if case.age <= 5:
+            patterns['age_groups']['0-5 years'] += 1
+        elif case.age <= 10:
+            patterns['age_groups']['6-10 years'] += 1
+        elif case.age <= 15:
+            patterns['age_groups']['11-15 years'] += 1
         else:
-            p_popup="INITIAL Primary Location (LGBM)"; p_icon_color="red"; p_icon="star"; p_prefix='fa'
+            patterns['age_groups']['16+ years'] += 1
         
-        # Enhanced popup for primary prediction
-        primary_popup_html = f"""
-            <b>{p_popup}</b><br>
-            Coords: {p_lat:.4f}, {p_lon:.4f}<br>
-            Risk: {risk_map.get(pred['risk_label'])} ({pred['risk_prob']:.1%})<br>
-            Est. Recovery Time: {int(pred['recovery_time_hours'])} hrs
-        """
+        patterns['gender_distribution'][case.gender] += 1
         
-        # Add primary location marker and search radius
-        folium.Marker([p_lat, p_lon], popup=folium.Popup(primary_popup_html, max_width=300), icon=folium.Icon(color=p_icon_color, icon=p_icon, prefix=p_prefix)).add_to(m)
+        hour = case.date_reported.hour
+        if 6 <= hour < 12:
+            patterns['time_patterns']['Morning (6-12)'] += 1
+        elif 12 <= hour < 18:
+            patterns['time_patterns']['Afternoon (12-18)'] += 1
+        elif 18 <= hour < 24:
+            patterns['time_patterns']['Evening (18-24)'] += 1
+        else:
+            patterns['time_patterns']['Night (0-6)'] += 1
         
-        # Radius shrinks as recovery probability increases
-        radius_m = max(500, 15000 * (1 - pred['recovered_prob']))
-        folium.Circle(radius=radius_m, location=[p_lat, p_lon], color=p_icon_color, fill=True, fill_opacity=0.15, popup="Primary Search Radius").add_to(m)
+        location = case.last_seen_location.lower()
+        if any(word in location for word in ['park', 'playground']):
+            patterns['location_types']['Parks/Playgrounds'] += 1
+        elif any(word in location for word in ['school', 'university']):
+            patterns['location_types']['Educational'] += 1
+        elif any(word in location for word in ['mall', 'store', 'shop']):
+            patterns['location_types']['Commercial'] += 1
+        elif any(word in location for word in ['home', 'house', 'residence']):
+            patterns['location_types']['Residential'] += 1
+        else:
+            patterns['location_types']['Other'] += 1
+    
+    found_cases = [c for c in cases if c.status == 'found']
+    total_cases = len(cases)
+    
+    if total_cases > 0:
+        patterns['recovery_rates']['overall'] = (len(found_cases) / total_cases) * 100
+        
+        age_recovery = {}
+        for age_group in patterns['age_groups']:
+            age_cases = [c for c in cases if get_age_group(c.age) == age_group]
+            age_found = [c for c in age_cases if c.status == 'found']
+            if age_cases:
+                age_recovery[age_group] = (len(age_found) / len(age_cases)) * 100
+        
+        patterns['recovery_rates']['by_age'] = age_recovery
+    
+    return patterns
 
-    # --- Secondary Hotspots (Historical Clustering) ---
-    st.markdown("---")
-    st.markdown("**Historical Context (Secondary Hotspots):** Analyzing similar past cases...")
+def get_age_group(age):
+    """Helper function to get age group"""
+    if age <= 5:
+        return '0-5 years'
+    elif age <= 10:
+        return '6-10 years'
+    elif age <= 15:
+        return '11-15 years'
+    else:
+        return '16+ years'
+
+def generate_predictive_insights():
+    """Generate human-readable insights from analytics"""
+    zones = analyze_risk_zones()
+    patterns = analyze_demographic_patterns()
     
-    recovered_df = df[df['recovered']==1].dropna(subset=['recovery_latitude'])
+    insights = []
     
-    # Find historical cases with similar time and context
-    if st.session_state.initial_case_input:
-        hour = st.session_state.initial_case_input['abduction_time']
-        relation = st.session_state.initial_case_input['abductor_relation']
-        region_type = st.session_state.initial_case_input['region_type']
+    if zones:
+        high_risk_zones = [z for z in zones if z['risk_score'] > 70]
+        medium_risk_zones = [z for z in zones if 40 <= z['risk_score'] <= 70]
+        
+        if high_risk_zones:
+            insights.append(f"🔴 HIGH RISK: {len(high_risk_zones)} zones identified with elevated risk (score >70)")
+        if medium_risk_zones:
+            insights.append(f"🟡 MEDIUM RISK: {len(medium_risk_zones)} zones require monitoring (score 40-70)")
     
-        time_mask = (recovered_df['abduction_time'].between(hour-2, hour+2))
-        context_mask = (recovered_df['abductor_relation'] == relation) & (recovered_df['region_type'] == region_type)
-        similar_cases = recovered_df[time_mask & context_mask].copy()
+    if patterns.get('age_groups'):
+        most_vulnerable = max(patterns['age_groups'].items(), key=lambda x: x[1])
+        insights.append(f"👶 DEMOGRAPHICS: {most_vulnerable[0]} age group has highest incident rate ({most_vulnerable[1]} cases)")
     
-        if not similar_cases.empty:
-            # Anchor for secondary hotspots is the last known location (either last sighting or initial point)
-            anchor_lat = st.session_state.sightings[-1]['lat'] if st.session_state.sightings else lat
-            anchor_lon = st.session_state.sightings[-1]['lon'] if st.session_state.sightings else lon
-            
-            # FIX: Explicitly convert scalar anchor coordinates to arrays of the same size 
-            # as the DataFrame columns to enable vectorized Haversine calculation without error.
-            anchor_lat_array = np.full_like(similar_cases['recovery_latitude'], anchor_lat)
-            anchor_lon_array = np.full_like(similar_cases['recovery_longitude'], anchor_lon)
+    if patterns.get('time_patterns'):
+        peak_time = max(patterns['time_patterns'].items(), key=lambda x: x[1])
+        insights.append(f"⏰ TIMING: Most incidents occur during {peak_time[0]} ({peak_time[1]} cases)")
     
-            distances = haversine(
-                anchor_lat_array, 
-                anchor_lon_array, 
-                similar_cases['recovery_latitude'], 
-                similar_cases['recovery_longitude']
-            )
-            relevant_cases = similar_cases[distances < 150]
+    if patterns.get('location_types'):
+        common_location = max(patterns['location_types'].items(), key=lambda x: x[1])
+        insights.append(f"📍 LOCATIONS: {common_location[0]} areas account for most incidents ({common_location[1]} cases)")
     
-            if len(relevant_cases) >= 10:
-                coords=relevant_cases[['recovery_latitude','recovery_longitude']].values
-                # Determine K for K-Means (max 4 clusters)
-                k=max(1, min(4, len(relevant_cases)//20))
-                # Use 'auto' for n_init to satisfy newer sklearn warnings/requirements
-                kmeans=KMeans(n_clusters=k,n_init='auto',random_state=RANDOM_SEED).fit(coords)
+    if patterns.get('recovery_rates', {}).get('overall'):
+        recovery_rate = patterns['recovery_rates']['overall']
+        if recovery_rate > 80:
+            insights.append(f"✅ POSITIVE: High recovery rate of {recovery_rate:.1f}%")
+        elif recovery_rate < 50:
+            insights.append(f"⚠️ CONCERN: Low recovery rate of {recovery_rate:.1f}% - review response protocols")
+    
+    return insights
+
+# Routes
+
+@app.route('/admin/delete_case/<report_id>', methods=['POST'])
+@login_required
+def delete_case(report_id):
+    """Delete a missing child case and all associated data"""
+    try:
+        missing_child = MissingChild.query.filter_by(report_id=report_id).first_or_404()
+        
+        # Store child name for flash message
+        child_name = missing_child.name
+        
+        # Delete associated sightings first (foreign key constraint)
+        sightings = Sighting.query.filter_by(report_id=report_id).all()
+        for sighting in sightings:
+            db.session.delete(sighting)
+        
+        # Delete files from Cloudinary if they exist
+        if CLOUDINARY_ENABLED:
+            try:
+                # Delete photo from Cloudinary
+                if missing_child.photo_filename and missing_child.photo_filename.startswith('http'):
+                    photo_public_id = f"missing_children/photos/{report_id}_photo"
+                    cloudinary.uploader.destroy(photo_public_id)
+                    print(f"✅ Deleted photo from Cloudinary: {photo_public_id}")
                 
-                st.info(f"Identified {len(relevant_cases)} historically similar cases. Clustered into {k} secondary hotspots.")
-    
-                for i in range(k):
-                    center_lat,center_lon = kmeans.cluster_centers_[i]
-                    # Secondary circles use the risk color (using pred['risk_label'] which holds the score 0, 1, or 2)
-                    folium.Circle(radius=10000, location=[center_lat, center_lon], color=color_map.get(pred['risk_label']), fill=True, fill_opacity=0.1, popup=f"Secondary Hotspot {i+1} (Historical Cluster)").add_to(m)
-            elif len(relevant_cases) > 0:
-                st.info(f"Found {len(relevant_cases)} historically similar cases, but not enough for clustering (min 10 required).")
-            else:
-                st.info("No historically similar cases found in the local area (within 150km radius).")
+                # Delete audio from Cloudinary
+                if missing_child.audio_filename and missing_child.audio_filename.startswith('http'):
+                    audio_public_id = f"missing_children/audio/{report_id}_audio"
+                    cloudinary.uploader.destroy(audio_public_id, resource_type="video")
+                    print(f"✅ Deleted audio from Cloudinary: {audio_public_id}")
+                    
+            except Exception as cloudinary_error:
+                print(f"⚠️ Cloudinary deletion error: {str(cloudinary_error)}")
         else:
-            st.info("No historically similar cases found with the same abduction time and context.")
-            
-    # Display the map using the unique key to force redraw when state changes
-    st_folium(m, key=st.session_state.map_key, width=1200, height=600)
+            # Delete local files if they exist
+            try:
+                if missing_child.photo_filename and not missing_child.photo_filename.startswith('http'):
+                    photo_path = os.path.join(app.config['UPLOAD_FOLDER'], 'photos', missing_child.photo_filename.split('/')[-1])
+                    if os.path.exists(photo_path):
+                        os.remove(photo_path)
+                        print(f"✅ Deleted local photo: {photo_path}")
+                
+                if missing_child.audio_filename and not missing_child.audio_filename.startswith('http'):
+                    audio_path = os.path.join(app.config['UPLOAD_FOLDER'], 'audio', missing_child.audio_filename.split('/')[-1])
+                    if os.path.exists(audio_path):
+                        os.remove(audio_path)
+                        print(f"✅ Deleted local audio: {audio_path}")
+                        
+            except Exception as file_error:
+                print(f"⚠️ Local file deletion error: {str(file_error)}")
+        
+        # Delete the missing child record
+        db.session.delete(missing_child)
+        db.session.commit()
+        
+        # No broadcast on delete per requirements
+        
+        flash(f'Case for {child_name} (ID: {report_id}) has been permanently deleted along with all associated data.', 'success')
+        
+    except Exception as e:
+        db.session.rollback()
+        print(f"❌ Error deleting case: {str(e)}")
+        flash(f'Error deleting case: {str(e)}', 'error')
+    
+    return redirect(url_for('admin_dashboard'))
 
+@app.route('/admin/bulk_delete', methods=['POST'])
+@login_required
+def bulk_delete_cases():
+    """Delete multiple cases at once"""
+    try:
+        case_ids = request.form.getlist('case_ids')
+        
+        if not case_ids:
+            flash('No cases selected for deletion.', 'warning')
+            return redirect(url_for('admin_dashboard'))
+        
+        deleted_count = 0
+        deleted_names = []
+        
+        for report_id in case_ids:
+            missing_child = MissingChild.query.filter_by(report_id=report_id).first()
+            if missing_child:
+                deleted_names.append(missing_child.name)
+                
+                # Delete associated sightings
+                sightings = Sighting.query.filter_by(report_id=report_id).all()
+                for sighting in sightings:
+                    db.session.delete(sighting)
+                
+                # Delete files (same logic as single delete)
+                if CLOUDINARY_ENABLED:
+                    try:
+                        if missing_child.photo_filename and missing_child.photo_filename.startswith('http'):
+                            photo_public_id = f"missing_children/photos/{report_id}_photo"
+                            cloudinary.uploader.destroy(photo_public_id)
+                        
+                        if missing_child.audio_filename and missing_child.audio_filename.startswith('http'):
+                            audio_public_id = f"missing_children/audio/{report_id}_audio"
+                            cloudinary.uploader.destroy(audio_public_id, resource_type="video")
+                    except:
+                        pass
+                
+                # Delete the record
+                db.session.delete(missing_child)
+                deleted_count += 1
+        
+        db.session.commit()
+        
+        # No broadcast on bulk delete per requirements
+        
+        flash(f'Successfully deleted {deleted_count} cases: {", ".join(deleted_names)}', 'success')
+        
+    except Exception as e:
+        db.session.rollback()
+        flash(f'Error during bulk deletion: {str(e)}', 'error')
+    
+    return redirect(url_for('admin_dashboard'))
+
+
+@app.route('/')
+def index():
+    recent_cases = MissingChild.query.filter_by(status='missing').order_by(MissingChild.date_reported.desc()).limit(5).all()
+    return render_template('index.html', recent_cases=recent_cases)
+
+@app.route('/report', methods=['GET', 'POST'])
+def report_missing():
+    if request.method == 'POST':
+        report_id = f"MC{datetime.now().strftime('%Y%m%d')}{str(uuid.uuid4())[:8].upper()}"
+        
+        name = request.form['name']
+        age = request.form['age']
+        gender = request.form['gender']
+        location = request.form['location']
+        location_subcategory = request.form.get('location_subcategory', '').strip() or None
+        description = request.form['description']
+        emergency_contact = request.form['emergency_contact']
+        
+        lat, lng = get_location_coordinates(location)
+        
+        photo_url = None
+        audio_url = None
+        
+        # Handle photo upload
+        if 'photo' in request.files:
+            photo = request.files['photo']
+            if photo and photo.filename and allowed_file(photo.filename, {'png', 'jpg', 'jpeg', 'gif'}):
+                if CLOUDINARY_ENABLED:
+                    # Upload to Cloudinary
+                    photo_url = upload_to_cloudinary(
+                        photo,
+                        'missing_children/photos',
+                        f"{report_id}_photo"
+                    )
+                    if photo_url:
+                        print(f"✅ Photo uploaded to Cloudinary: {photo_url}")
+                    else:
+                        flash('Photo upload failed, but report was created successfully', 'warning')
+                else:
+                    # Use improved local storage
+                    photo_filename = secure_filename(f"{report_id}_{photo.filename}")
+                    photo_url = save_file_locally(photo, 'photos', photo_filename)
+                    if photo_url:
+                        print(f"✅ Photo saved locally: {photo_url}")
+                    else:
+                        flash('Photo upload failed, but report was created successfully', 'warning')
+        
+        # Handle audio upload
+        if 'audio' in request.files:
+            audio = request.files['audio']
+            if audio and audio.filename and allowed_file(audio.filename, {'mp3', 'wav', 'ogg', 'm4a'}):
+                if CLOUDINARY_ENABLED:
+                    # Upload to Cloudinary
+                    audio_url = upload_audio_to_cloudinary(
+                        audio,
+                        f"{report_id}_audio"
+                    )
+                    if audio_url:
+                        print(f"✅ Audio uploaded to Cloudinary: {audio_url}")
+                    else:
+                        flash('Audio upload failed, but report was created successfully', 'warning')
+                else:
+                    # Use improved local storage
+                    audio_filename = secure_filename(f"{report_id}_{audio.filename}")
+                    audio_url = save_file_locally(audio, 'audio', audio_filename)
+                    if audio_url:
+                        print(f"✅ Audio saved locally: {audio_url}")
+                    else:
+                        flash('Audio upload failed, but report was created successfully', 'warning')
+        
+        # Create missing child record with URLs instead of filenames
+        missing_child = MissingChild(
+            report_id=report_id,
+            name=name,
+            age=age,
+            gender=gender,
+            last_seen_location=location,
+            location_subcategory=location_subcategory,
+            last_seen_lat=lat,
+            last_seen_lng=lng,
+            description=description,
+            photo_filename=photo_url,
+            audio_filename=audio_url,
+            emergency_contact=emergency_contact
+        )
+        
+        db.session.add(missing_child)
+        db.session.commit()
+        
+        # Send SMS alert
+        report_url = request.url_root + f"found/{report_id}"
+        sms_message = f"MISSING: {name}, {age}yrs, {gender}, {location}. Report sightings: {report_url}"
+        
+        # Area-wise broadcasting at report time as well
+        target_numbers = select_numbers_for_location(location)
+        sent_count = send_sms_alert_to_numbers(sms_message, target_numbers)
+        
+        if sent_count > 0:
+            flash(f'Missing child report created successfully! Report ID: {report_id}. Alert sent to {sent_count} subscribers.', 'success')
+        else:
+            flash(f'Missing child report created successfully! Report ID: {report_id}. However, SMS alerts could not be sent.', 'warning')
+        
+        return redirect(url_for('case_detail', report_id=report_id))
+    
+    return render_template('report.html')
+
+@app.route('/found/<report_id>', methods=['GET', 'POST'])
+def report_found(report_id):
+    missing_child = MissingChild.query.filter_by(report_id=report_id).first_or_404()
+    
+    if request.method == 'POST':
+        location = request.form['location']
+        description = request.form.get('description', '')
+        reporter_phone = request.form.get('reporter_phone', '')
+        
+        lat, lng = get_location_coordinates(location)
+
+        # Optional photo upload for sighting
+        sighting_photo_url = None
+        if 'photo' in request.files:
+            photo = request.files['photo']
+            if photo and photo.filename and allowed_file(photo.filename, {'png', 'jpg', 'jpeg', 'gif'}):
+                if CLOUDINARY_ENABLED:
+                    sighting_photo_url = upload_to_cloudinary(
+                        photo,
+                        'missing_children/sightings',
+                        f"{report_id}_sighting_{int(datetime.utcnow().timestamp())}"
+                    )
+                else:
+                    photo_filename = secure_filename(f"{report_id}_sighting_{photo.filename}")
+                    sighting_photo_url = save_file_locally(photo, 'photos', photo_filename)
+        
+        sighting = Sighting(
+            report_id=report_id,
+            location=location,
+            latitude=lat or 0,
+            longitude=lng or 0,
+            description=description,
+            reporter_phone=reporter_phone,
+            photo_filename=sighting_photo_url
+        )
+        
+        db.session.add(sighting)
+        db.session.commit()
+        
+        report_url = request.url_root + f"found/{report_id}"
+        sms_message = (
+            f"SIGHTING: {missing_child.name} spotted at {location}. "
+            f"Time: {datetime.now().strftime('%H:%M')}. ID: {report_id}. "
+            f"Report/updates: {report_url}"
+        )
+        
+        # Area-wise broadcasting: choose numbers based on location text
+        target_numbers = select_numbers_for_location(location)
+        sent_count = send_sms_alert_to_numbers(sms_message, target_numbers)
+        
+        flash('Thank you for reporting the sighting! Alert sent to authorities and subscribers.', 'success')
+        return redirect(url_for('report_found', report_id=report_id))
+    
+    return render_template('found.html', child=missing_child)
+
+@app.route('/case/<report_id>')
+def case_detail(report_id):
+    missing_child = MissingChild.query.filter_by(report_id=report_id).first_or_404()
+    sightings = Sighting.query.filter_by(report_id=report_id).order_by(Sighting.sighting_time.desc()).all()
+    return render_template('case_detail.html', child=missing_child, sightings=sightings)
+
+@app.route('/admin/login', methods=['GET', 'POST'])
+def admin_login():
+    # Obfuscation: require a valid access token hint via query/header to render login
+    required_token = app.config.get('ADMIN_ACCESS_TOKEN')
+    provided_token = request.args.get('t') or request.headers.get('X-Admin-Token')
+    if required_token and provided_token != required_token:
+        # Return 404 to avoid revealing admin endpoint
+        return render_template('errors/404.html'), 404
+
+    client_key = f"ip:{_get_client_ip()}"
+    if _is_locked_out(client_key):
+        flash('Too many attempts. Try again later.', 'error')
+        return render_template('admin/login.html'), 429
+
+    if request.method == 'POST':
+        username = request.form['username']
+        password = request.form['password']
+
+        is_valid = (
+            username == app.config['ADMIN_USERNAME'] and
+            password == app.config['ADMIN_PASSWORD']
+        )
+
+        if is_valid:
+            _reset_failed_attempts(client_key)
+            user = User.query.filter_by(username=username).first()
+            if not user:
+                user = User(username=username, password_hash=generate_password_hash(password))
+                db.session.add(user)
+                db.session.commit()
+            login_user(user)
+            return redirect(url_for('admin_dashboard'))
+        else:
+            _register_failed_attempt(client_key)
+            # Generic error message
+            flash('Invalid credentials', 'error')
+
+    return render_template('admin/login.html')
+
+@app.route('/admin/dashboard')
+@login_required
+def admin_dashboard():
+    cases = MissingChild.query.order_by(MissingChild.date_reported.desc()).all()
+    total_cases = len(cases)
+    active_cases = len([c for c in cases if c.status == 'missing'])
+    found_cases = len([c for c in cases if c.status == 'found'])
+    
+    return render_template('admin/dashboard.html', 
+                         cases=cases, 
+                         total_cases=total_cases,
+                         active_cases=active_cases,
+                         found_cases=found_cases)
+
+# Optionally return 404 for unauthorized access to admin routes (already protected by @login_required).
+
+@app.route('/admin/case/<report_id>')
+@login_required
+def admin_case_detail(report_id):
+    missing_child = MissingChild.query.filter_by(report_id=report_id).first_or_404()
+    sightings = Sighting.query.filter_by(report_id=report_id).order_by(Sighting.sighting_time.desc()).all()
+    
+    heat_data = []
+    for sighting in sightings:
+        if sighting.latitude and sighting.longitude:
+            hours_ago = (datetime.utcnow() - sighting.sighting_time).total_seconds() / 3600
+            intensity = max(0.1, 1.0 - (hours_ago / 168))
+            heat_data.append([sighting.latitude, sighting.longitude, intensity])
+    
+    return render_template('admin/case_detail.html', 
+                         child=missing_child, 
+                         sightings=sightings,
+                         heat_data=json.dumps(heat_data))
+
+@app.route('/admin/update_status/<report_id>/<status>')
+@login_required
+def update_case_status(report_id, status):
+    missing_child = MissingChild.query.filter_by(report_id=report_id).first_or_404()
+    old_status = missing_child.status
+    missing_child.status = status
+    db.session.commit()
+    
+    if status == 'found' and old_status == 'missing':
+        sms_message = f"FOUND: {missing_child.name} ({missing_child.age}yrs) found safe! ID: {report_id}. Thank you for helping!"
+        sent_count = send_sms_alert(sms_message)
+        flash(f'Case marked as FOUND! Alert sent to {sent_count} subscribers.', 'success')
+    elif status == 'missing' and old_status == 'found':
+        sms_message = f"URGENT: {missing_child.name} missing again! {missing_child.last_seen_location}. ID: {report_id}"
+        target_numbers = select_numbers_for_location(missing_child.last_seen_location)
+        sent_count = send_sms_alert_to_numbers(sms_message, target_numbers)
+        flash(f'Case marked as MISSING again! Alert sent to {sent_count} subscribers.', 'warning')
+    elif status == 'closed':
+        sms_message = f"CLOSED: {missing_child.name} case closed. ID: {report_id}"
+        sent_count = send_sms_alert(sms_message)
+        flash(f'Case closed! Alert sent to {sent_count} subscribers.', 'info')
+    else:
+        flash(f'Case status updated to {status}', 'success')
+    
+    return redirect(url_for('admin_case_detail', report_id=report_id))
+
+@app.route('/admin/logout')
+@login_required
+def admin_logout():
+    logout_user()
+    return redirect(url_for('index'))
+
+@app.route('/admin/analytics')
+@login_required
+def admin_analytics():
+    zones = analyze_risk_zones()
+    patterns = analyze_demographic_patterns()
+    insights = generate_predictive_insights()
+    
+    analytics_data = {
+        'zones': len(zones),
+        'patterns': patterns,
+        'timestamp': datetime.utcnow().isoformat()
+    }
+    
+    analytics_record = Analytics(
+        analysis_type='comprehensive',
+        analysis_data=json.dumps(analytics_data),
+        insights='; '.join(insights)
+    )
+    db.session.add(analytics_record)
+    db.session.commit()
+    
+    return render_template('admin/analytics.html', 
+                         zones=zones, 
+                         patterns=patterns, 
+                         insights=insights)
+
+@app.route('/admin/risk-zones')
+@login_required
+def admin_risk_zones():
+    risk_zones = RiskZone.query.filter_by(is_active=True).all()
+    cases = MissingChild.query.filter(
+        MissingChild.last_seen_lat.isnot(None),
+        MissingChild.last_seen_lng.isnot(None)
+    ).all()
+    
+    return render_template('admin/risk_zones.html', 
+                         risk_zones=risk_zones, 
+                         cases=cases)
+
+@app.route('/api/geocode')
+def geocode():
+    location = request.args.get('location', '').strip()
+    if not location:
+        return jsonify({'error': 'Location parameter is required'}), 400
+    
+    lat, lng = get_location_coordinates(location)
+    if lat and lng:
+        return jsonify({
+            'lat': lat, 
+            'lng': lng,
+            'success': True,
+            'location': location
+        })
+    return jsonify({
+        'error': 'Location not found',
+        'success': False,
+        'location': location
+    }), 404
+
+@app.route('/api/analytics/update')
+@login_required
+def update_analytics():
+    try:
+        zones = analyze_risk_zones()
+        patterns = analyze_demographic_patterns()
+        insights = generate_predictive_insights()
+        
+        return jsonify({
+            'success': True,
+            'zones': len(zones),
+            'insights': insights
+        })
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+@app.route('/test-sms')
+def test_sms():
+    """Test route to send a sample SMS - remove in production"""
+    if not app.config['DEBUG'] and not current_user.is_authenticated:
+        return "Unauthorized", 401
+    
+    test_message = f"TEST: Child Alert System working. Time: {datetime.now().strftime('%H:%M')}"
+    sent_count = send_sms_alert(test_message)
+    
+    if sent_count > 0:
+        return f"✅ Test SMS sent to {sent_count} numbers successfully!"
+    else:
+        return "❌ Test SMS failed. Check server logs for details."
+
+@app.errorhandler(404)
+def not_found_error(error):
+    return render_template('errors/404.html'), 404
+
+@app.errorhandler(500)
+def internal_error(error):
+    db.session.rollback()
+    return render_template('errors/500.html'), 500
+
+# Health check endpoint for Render
+@app.route('/health')
+def health_check():
+    return jsonify({'status': 'healthy', 'timestamp': datetime.utcnow().isoformat()})
+
+# ... (keep everything above as is until the create_tables function)
+
+# Initialize database
+def create_tables():
+    """Create database tables if they don't exist"""
+    try:
+        with app.app_context():
+            # Check if we can connect to database (using newer SQLAlchemy syntax)
+            with db.engine.connect() as connection:
+                connection.execute(db.text('SELECT 1'))
+            print("✅ Database connection successful")
+            
+            # Create tables if they don't exist
+            db.create_all()
+            print("✅ Database tables created/verified")
+            
+            # Check for missing columns and add them
+            try:
+                with db.engine.connect() as connection:
+                    # Check if emergency_contact column exists
+                    result = connection.execute(db.text("""
+                        SELECT column_name 
+                        FROM information_schema.columns 
+                        WHERE table_name='missing_child' AND column_name='emergency_contact'
+                    """))
+                    
+                    if not result.fetchone():
+                        print("🔄 Adding emergency_contact column to missing_child table...")
+                        connection.execute(db.text("""
+                            ALTER TABLE missing_child 
+                            ADD COLUMN emergency_contact VARCHAR(100)
+                        """))
+                        connection.commit()
+                        print("✅ emergency_contact column added successfully")
+                    else:
+                        print("✅ emergency_contact column already exists")
+
+                    # Check if photo_filename exists on sighting
+                    result2 = connection.execute(db.text("""
+                        SELECT column_name 
+                        FROM information_schema.columns 
+                        WHERE table_name='sighting' AND column_name='photo_filename'
+                    """))
+                    if not result2.fetchone():
+                        print("🔄 Adding photo_filename column to sighting table...")
+                        connection.execute(db.text("""
+                            ALTER TABLE sighting 
+                            ADD COLUMN photo_filename VARCHAR(500)
+                        """))
+                        connection.commit()
+                        print("✅ photo_filename column added successfully")
+                    else:
+                        print("✅ photo_filename column already exists on sighting")
+                    
+                    # Check if location_subcategory exists on missing_child
+                    result3 = connection.execute(db.text("""
+                        SELECT column_name 
+                        FROM information_schema.columns 
+                        WHERE table_name='missing_child' AND column_name='location_subcategory'
+                    """))
+                    if not result3.fetchone():
+                        print("🔄 Adding location_subcategory column to missing_child table...")
+                        connection.execute(db.text("""
+                            ALTER TABLE missing_child 
+                            ADD COLUMN location_subcategory VARCHAR(200)
+                        """))
+                        connection.commit()
+                        print("✅ location_subcategory column added successfully")
+                    else:
+                        print("✅ location_subcategory column already exists on missing_child")
+                        
+            except Exception as migration_error:
+                print(f"⚠️ Migration error: {str(migration_error)}")
+                # Continue anyway - the column might exist or be added later
+            
+            # Create admin user if it doesn't exist
+            admin_user = User.query.filter_by(username='admin').first()
+            if not admin_user:
+                from werkzeug.security import generate_password_hash
+                admin_password = os.environ.get('ADMIN_PASSWORD', 'admin123')
+                admin_user = User(
+                    username='admin',
+                    password_hash=generate_password_hash(admin_password)
+                )
+                db.session.add(admin_user)
+                db.session.commit()
+                print("✅ Default admin user created")
+            
+            # Check if we have any existing data
+            try:
+                case_count = MissingChild.query.count()
+                user_count = User.query.count()
+                print(f"📊 Database ready with {case_count} cases, {user_count} users")
+            except Exception as count_error:
+                print(f"⚠️ Could not count existing data: {str(count_error)}")
+            
+    except Exception as e:
+        print(f"❌ Database connection error: {str(e)}")
+        # If connection fails, try to create tables anyway
+        try:
+            print("🔄 Attempting to create tables...")
+            db.create_all()
+            print("✅ Database tables created successfully")
+        except Exception as create_error:
+            print(f"❌ Failed to create tables: {str(create_error)}")
+            # Don't raise error in production - let the app start anyway
+            if not app.config.get('DEBUG', False):
+                print("⚠️ Continuing without database verification (production mode)")
+            else:
+                raise create_error
+            
+# Add this route for debugging image URLs
+@app.route('/debug/case/<report_id>')
+def debug_case(report_id):
+    if not app.config['DEBUG'] and not current_user.is_authenticated:
+        return "Unauthorized", 401
+    
+    missing_child = MissingChild.query.filter_by(report_id=report_id).first_or_404()
+    
+    debug_info = {
+        'report_id': missing_child.report_id,
+        'name': missing_child.name,
+        'photo_filename': missing_child.photo_filename,
+        'photo_is_url': missing_child.photo_filename.startswith('http') if missing_child.photo_filename else False,
+        'audio_filename': missing_child.audio_filename,
+        'audio_is_url': missing_child.audio_filename.startswith('http') if missing_child.audio_filename else False,
+        'cloudinary_enabled': CLOUDINARY_ENABLED
+    }
+    
+    return jsonify(debug_info)
+
+if __name__ == '__main__':
+    create_tables()
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=app.config['DEBUG'])
 else:
-    st.info("Enter case details in the sidebar and click 'Predict Initial Case' to begin.")
-
-
-
-
-
-
-
-
-
-
-
-
-
-# import streamlit as st
-# import pandas as pd
-# import folium
-# from streamlit_folium import st_folium
-# import os
-# import numpy as np
-# from sklearn.cluster import KMeans
-# from datetime import datetime
-
-# # --- Imports and Initial Error Checking ---
-# # This block ensures the app provides a helpful error if models haven't been trained
-# try:
-#     # Attempt to import prediction functions and helper
-#     from predictor import predict_initial_case, refine_location_with_sightings, haversine
-# except ImportError:
-#     st.error("FATAL ERROR: The 'predictor.py' file was not found. Please ensure it is in the same directory.")
-#     st.stop()
-# except Exception as e:
-#     # This catches errors during model loading inside predictor.py
-#     st.error(f"FATAL ERROR on startup: Could not load models from predictor.py. Have you run train.py successfully? Details: {e}")
-#     st.stop()
-
-# # --- Configuration ---
-# RANDOM_SEED = 42
-# DATASET_PATH = "sachet_main_cases_2M.csv" # Ensure this points to the generated dataset
-
-# st.set_page_config(page_title="Sachet: Advanced Alert System", layout="wide")
-# st.title("🔔 Sachet: Advanced Predictive Alert System")
-
-# @st.cache_data
-# def load_data(path):
-#     """Loads historical case data for generating secondary hotspots."""
-#     if os.path.exists(path):
-#         # Load only necessary columns for efficiency
-#         return pd.read_csv(path, usecols=['case_id', 'abduction_time', 'abductor_relation', 'region_type', 'recovered', 'recovery_latitude', 'recovery_longitude'])
-#     return None
-
-# df = load_data(DATASET_PATH)
-# if df is None:
-#     st.error(f"FATAL ERROR: Dataset '{DATASET_PATH}' not found. Please run your data generator script first.")
-#     st.stop()
-
-# # --- Initialize Session State ---
-# # This ensures variables persist between user interactions, preventing UI bugs.
-# if 'prediction' not in st.session_state: st.session_state.prediction = None
-# if 'sightings' not in st.session_state: st.session_state.sightings = []
-# if 'refined_location' not in st.session_state: st.session_state.refined_location = None
-# if 'initial_case_input' not in st.session_state: st.session_state.initial_case_input = None
-# if 'map_key' not in st.session_state: st.session_state.map_key = 'initial_map'
-
-# # --- Sidebar: Input Form ---
-# st.sidebar.header("Enter Case Details")
-# age = st.sidebar.slider("Child Age", 1, 18, 9, key="age")
-# gender = st.sidebar.selectbox("Child Gender", ["M", "F"], key="gender")
-# hour = st.sidebar.slider("Abduction Time (24h format)", 0, 23, 17, key="hour")
-# dow = st.sidebar.slider("Day of Week (0=Mon, 6=Sun)", 0, 6, 4, key="dow")
-# st.sidebar.subheader("Location & Context")
-# # Default coordinates set to Mumbai (Maharashtra capital)
-# lat = st.sidebar.number_input("Last Seen Latitude", value=19.0760, format="%.4f", key="lat")
-# lon = st.sidebar.number_input("Last Seen Longitude", value=72.8777, format="%.4f", key="lon")
-# region_type = st.sidebar.selectbox("Region Type", df['region_type'].unique(), key="region")
-# pop_density = st.sidebar.number_input("Population Density", value=20000, min_value=10, key="pop")
-# transport_hub = st.sidebar.selectbox("Major Transport Hub Nearby?", [1, 0], format_func=lambda x: 'Yes' if x==1 else 'No', key="hub")
-# st.sidebar.subheader("Abductor Information")
-# relation = st.sidebar.selectbox("Abductor Relation", df['abductor_relation'].unique(), key="relation")
-
-# if st.sidebar.button("Predict Initial Case", type="primary", use_container_width=True):
-#     # 1. Collect all input features
-#     case_input = {
-#         'child_age':age, 'child_gender':gender, 'abduction_time':hour, 'abductor_relation':relation, 
-#         'latitude':lat, 'longitude':lon, 'day_of_week':dow, 'region_type':region_type, 
-#         'population_density':pop_density, 'transport_hub_nearby':transport_hub
-#     }
-    
-#     # 2. Calculate dist_to_nearest_city (Required for Stage 2 static features)
-#     CITY_CENTERS = {"Mumbai":(19.0760,72.8777),"Pune":(18.5204,73.8567),"Nagpur":(21.1458,79.0882),"Nashik":(20.0112,73.7909)}
-#     dist = min([haversine(lat, lon, c_lat, c_lon) for c_lat, c_lon in CITY_CENTERS.values()]);
-#     case_input['dist_to_nearest_city'] = dist
-    
-#     # 3. Run Stage 1 Prediction
-#     with st.spinner("Running initial prediction using Stage 1 AI..."):
-#         st.session_state.initial_case_input = case_input # Save for Stage 2
-#         st.session_state.prediction = predict_initial_case(case_input)
-#         st.session_state.sightings = [] # Clear old sightings
-#         st.session_state.refined_location = None
-#         st.session_state.start_time = datetime.now()
-#         # Pre-fill sighting inputs with a likely first location
-#         st.session_state.s_lat_input = lat + np.random.uniform(-0.1, 0.1)
-#         st.session_state.s_lon_input = lon + np.random.uniform(-0.1, 0.1)
-#         st.session_state.s_hours_input = 5.0
-#         st.session_state.s_text_input = "heading towards major road"
-#         st.session_state.map_key = f'map_{datetime.now().timestamp()}'
-
-# # --- Sidebar: Live Sightings ---
-# st.sidebar.subheader("Live Sightings Management")
-# if st.session_state.prediction and st.session_state.prediction['recovered_label'] == 1:
-#     st.sidebar.number_input("Sighting Latitude", format="%.4f", key="s_lat_input")
-#     st.sidebar.number_input("Sighting Longitude", format="%.4f", key="s_lon_input")
-#     st.sidebar.text_input("Direction Description", key="s_text_input")
-#     st.sidebar.number_input("Hours Since Abduction", min_value=0.1, step=0.5, format="%.1f", key="s_hours_input")
-
-#     if st.sidebar.button("Add Sighting"):
-#         # Add new sighting and sort by time
-#         new_sighting = {'lat': st.session_state.s_lat_input, 'lon': st.session_state.s_lon_input, 'direction_text': st.session_state.s_text_input, 'hours_since': st.session_state.s_hours_input}
-#         st.session_state.sightings.append(new_sighting)
-#         st.session_state.sightings.sort(key=lambda s: s['hours_since'])
-#         st.sidebar.success("Sighting added! Click 'Refine Prediction' below.")
-#         st.session_state.map_key = f'map_{datetime.now().timestamp()}' # Force map redraw
-# else:
-#     st.sidebar.warning("Predict a case first. If the case is predicted as 'Not Recovered', refinement is disabled.")
-
-# # --- Main App Layout ---
-# if st.session_state.prediction:
-#     pred = st.session_state.prediction
-#     risk_map={0:"Low",1:"Medium",2:"High"}
-#     alert_map={0:"Internal Monitoring",1:"Local Alert",2:"State-Wide Alert (Amber)"}
-#     color_map={0:"green",1:"orange",2:"red"}
-
-#     st.header("🚨 Prediction Results")
-#     col1,col2=st.columns(2)
-#     col1.metric("Risk Level", f"{risk_map.get(pred['risk_label'])} Risk", f"Confidence: {pred['risk_prob']:.1%}")
-#     col2.metric("Recommended Alert", alert_map.get(pred['risk_label']))
-
-#     st.subheader("Recovery Prediction")
-#     colA,colB=st.columns(2)
-#     colA.metric("Probability of Recovery", f"{pred['recovered_prob']:.1%}")
-#     colB.metric("Est. Recovery Time", f"~{int(pred['recovery_time_hours'])} hours" if pred['recovery_time_hours']>0 else "N/A")
-
-#     st.subheader("📍 Predictive Location Analysis")
-    
-#     # Initialize Folium Map centered on the last seen location
-#     m = folium.Map(location=[lat, lon], zoom_start=8, tiles="OpenStreetMap")
-#     folium.Marker([lat, lon], popup="Last Seen Location", icon=folium.Icon(color="blue", icon="info-sign")).add_to(m)
-#     folium.Circle(radius=5000, location=[lat,lon], color="#800080", fill=True, fill_opacity=0.1, popup="Initial Search Area").add_to(m)
-
-#     # Display Sightings
-#     if st.session_state.sightings:
-#         st.info(f"{len(st.session_state.sightings)} sighting(s) logged. Use the button below to incorporate them.")
-#         sighting_points = []
-#         for s in st.session_state.sightings:
-#             folium.Marker([s['lat'], s['lon']], popup=f"Sighting @ {s['hours_since']:.1f} hrs", icon=folium.Icon(color='orange', icon='eye-open', prefix='fa')).add_to(m)
-#             sighting_points.append((s['lat'], s['lon']))
-#         if len(sighting_points) > 1:
-#             folium.PolyLine(sighting_points, color="orange", weight=2.5, opacity=0.8, popup="Sighting Path").add_to(m)
-
-#         # Refinement button
-#         if st.button("Refine Prediction with Live Sightings", type="secondary"):
-#             with st.spinner("Running Stage 2 AI (Deep Learning Refinement)..."):
-#                 r_lat, r_lon = refine_location_with_sightings(pred, st.session_state.sightings, st.session_state.initial_case_input)
-#                 st.session_state.refined_location = (r_lat, r_lon)
-#                 st.session_state.map_key = f'map_{datetime.now().timestamp()}'
-    
-#     # --- Primary Hotspot Determination (Initial or Refined) ---
-#     p_lat = st.session_state.refined_location[0] if st.session_state.refined_location else pred['predicted_latitude']
-#     p_lon = st.session_state.refined_location[1] if st.session_state.refined_location else pred['predicted_longitude']
-    
-#     if p_lat!=0: # Check if a location was actually predicted
-#         # Display primary hotspot (initial or refined)
-#         if st.session_state.refined_location:
-#             p_popup="REFINED Primary Location (LSTM)"; p_icon_color="purple"; p_icon="bullseye"; p_prefix='fa'
-#             st.success(f"AI refined primary hotspot to: {p_lat:.4f}, {p_lon:.4f}")
-#         else:
-#             p_popup="INITIAL Primary Location (LGBM)"; p_icon_color="red"; p_icon="star"; p_prefix='fa'
-        
-#         # Add primary location marker and search radius
-#         folium.Marker([p_lat, p_lon], popup=p_popup, icon=folium.Icon(color=p_icon_color, icon=p_icon, prefix=p_prefix)).add_to(m)
-        
-#         # Radius shrinks as recovery probability increases
-#         radius_m = max(500, 15000 * (1 - pred['recovered_prob']))
-#         folium.Circle(radius=radius_m, location=[p_lat, p_lon], color=p_icon_color, fill=True, fill_opacity=0.15, popup="Primary Search Radius").add_to(m)
-
-#     # --- Secondary Hotspots (Historical Clustering) ---
-#     st.markdown("---")
-#     st.markdown("**Historical Context (Secondary Hotspots):** Analyzing similar past cases...")
-    
-#     recovered_df = df[df['recovered']==1].dropna(subset=['recovery_latitude'])
-    
-#     # Find historical cases with similar time and context
-#     hour = st.session_state.initial_case_input['abduction_time']
-#     relation = st.session_state.initial_case_input['abductor_relation']
-#     region_type = st.session_state.initial_case_input['region_type']
-
-#     time_mask = (recovered_df['abduction_time'].between(hour-2, hour+2))
-#     context_mask = (recovered_df['abductor_relation'] == relation) & (recovered_df['region_type'] == region_type)
-#     similar_cases = recovered_df[time_mask & context_mask].copy()
-
-#     if not similar_cases.empty:
-#         # Anchor for secondary hotspots is the last known location (either last sighting or initial point)
-#         anchor_lat = st.session_state.sightings[-1]['lat'] if st.session_state.sightings else lat
-#         anchor_lon = st.session_state.sightings[-1]['lon'] if st.session_state.sightings else lon
-        
-#         # FIX: Explicitly convert scalar anchor coordinates to arrays of the same size 
-#         # as the DataFrame columns to enable vectorized Haversine calculation without error.
-#         anchor_lat_array = np.full_like(similar_cases['recovery_latitude'], anchor_lat)
-#         anchor_lon_array = np.full_like(similar_cases['recovery_longitude'], anchor_lon)
-
-#         distances = haversine(
-#             anchor_lat_array, 
-#             anchor_lon_array, 
-#             similar_cases['recovery_latitude'], 
-#             similar_cases['recovery_longitude']
-#         )
-#         relevant_cases = similar_cases[distances < 150]
-
-#         if len(relevant_cases) >= 10:
-#             coords=relevant_cases[['recovery_latitude','recovery_longitude']].values
-#             # Determine K for K-Means (max 4 clusters)
-#             k=max(1, min(4, len(relevant_cases)//20))
-#             # Use 'auto' for n_init to satisfy newer sklearn warnings/requirements
-#             kmeans=KMeans(n_clusters=k,n_init='auto',random_state=RANDOM_SEED).fit(coords)
-            
-#             st.info(f"Identified {len(relevant_cases)} historically similar cases. Clustered into {k} secondary hotspots.")
-
-#             for i in range(k):
-#                 center_lat,center_lon = kmeans.cluster_centers_[i]
-#                 # Secondary circles use the risk color
-#                 folium.Circle(radius=10000, location=[center_lat, center_lon], color=color_map.get(pred['risk_label']), fill=True, fill_opacity=0.1, popup=f"Secondary Hotspot {i+1} (Historical Cluster)").add_to(m)
-#         elif len(relevant_cases) > 0:
-#             st.info(f"Found {len(relevant_cases)} historically similar cases, but not enough for clustering (min 10 required).")
-#         else:
-#             st.info("No historically similar cases found in the local area (within 150km radius).")
-            
-#     # Display the map using the unique key to force redraw when state changes
-#     st_folium(m, key=st.session_state.map_key, width=1200, height=600)
-
-# else:
-#     st.info("Enter case details in the sidebar and click 'Predict Initial Case' to begin.")
-
+    # This runs in production with Gunicorn
+    create_tables()
