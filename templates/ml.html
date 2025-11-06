@@ -1,0 +1,97 @@
+{% extends "base.html" %}
+
+{% block title %}ML Prediction{% endblock %}
+
+{% block content %}
+<div class="container mt-4">
+  <div class="row">
+    <div class="col-md-4">
+      <h4>Case Input</h4>
+      <form id="ml-form">
+        <div class="mb-2">
+          <label class="form-label">Child Age</label>
+          <input type="number" class="form-control" name="child_age" value="9" min="1" max="18">
+        </div>
+        <div class="mb-2">
+          <label class="form-label">Gender</label>
+          <select name="child_gender" class="form-select">
+            <option value="M">M</option>
+            <option value="F">F</option>
+          </select>
+        </div>
+        <div class="mb-2">
+          <label class="form-label">Abduction Hour (0-23)</label>
+          <input type="number" class="form-control" name="abduction_time" value="18" min="0" max="23">
+        </div>
+        <div class="mb-2">
+          <label class="form-label">Last Seen Latitude</label>
+          <input type="number" step="0.0001" class="form-control" name="latitude" value="18.5203">
+        </div>
+        <div class="mb-2">
+          <label class="form-label">Last Seen Longitude</label>
+          <input type="number" step="0.0001" class="form-control" name="longitude" value="73.8567">
+        </div>
+        <div class="mb-2">
+          <label class="form-label">Region Type</label>
+          <select name="region_type" class="form-select">
+            <option>Urban</option>
+            <option>Suburban</option>
+            <option>Rural</option>
+          </select>
+        </div>
+        <div class="mb-2">
+          <label class="form-label">Abductor Relation</label>
+          <input type="text" class="form-control" name="abductor_relation" value="Stranger">
+        </div>
+        <div class="d-grid gap-2">
+          <button id="predict-btn" class="btn btn-primary">Predict Location Hotspots</button>
+        </div>
+      </form>
+
+      <hr>
+
+      <h5>Refine with Sightings</h5>
+      <form id="sighting-form" class="mb-3">
+        <div class="mb-2">
+          <label class="form-label">Sighting Latitude</label>
+          <input type="number" step="0.0001" class="form-control" name="s_lat" value="18.55">
+        </div>
+        <div class="mb-2">
+          <label class="form-label">Sighting Longitude</label>
+          <input type="number" step="0.0001" class="form-control" name="s_lon" value="73.86">
+        </div>
+        <div class="mb-2">
+          <label class="form-label">Hours Since Abduction</label>
+          <input type="number" step="0.1" class="form-control" name="s_hours" value="12.0">
+        </div>
+        <div class="mb-2">
+          <label class="form-label">Direction Description</label>
+          <input type="text" class="form-control" name="s_text" value="heading towards Solapur on NH 65">
+        </div>
+        <div class="d-grid gap-2">
+          <button id="add-sighting-btn" class="btn btn-secondary" type="button">Add Sighting</button>
+          <button id="refine-btn" class="btn btn-success" type="button">Refine Prediction</button>
+        </div>
+      </form>
+
+      <div id="sightings-list"></div>
+
+    </div>
+    <div class="col-md-8">
+      <h4>Prediction & Map</h4>
+      <div id="prediction-cards" class="mb-3"></div>
+      <div id="map" style="height:600px;"></div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/ml.js') }}"></script>
+<script>
+// Initialize map after page load
+document.addEventListener('DOMContentLoaded', function(){
+    window.ml_map = initializeMap('map', 18.5203, 73.8567, 10);
+});
+</script>
+{% endblock %}

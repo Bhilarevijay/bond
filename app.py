@@ -1085,18 +1085,69 @@ def admin_dashboard():
 def admin_case_detail(report_id):
     missing_child = MissingChild.query.filter_by(report_id=report_id).first_or_404()
     sightings = Sighting.query.filter_by(report_id=report_id).order_by(Sighting.sighting_time.desc()).all()
-    
+
     heat_data = []
     for sighting in sightings:
         if sighting.latitude and sighting.longitude:
             hours_ago = (datetime.utcnow() - sighting.sighting_time).total_seconds() / 3600
             intensity = max(0.1, 1.0 - (hours_ago / 168))
             heat_data.append([sighting.latitude, sighting.longitude, intensity])
-    
+
+    # Attempt to run ML prediction automatically using stored case and sightings
+    ml_prediction = None
+    ml_refined = None
+    try:
+        # Lazy import so admin pages still load if models are missing
+        from predictor import predict_initial_case, refine_location_with_sightings, haversine
+
+        # Build initial case input from stored fields (best-effort)
+        case_input = {
+            'child_age': missing_child.age or 0,
+            'child_gender': missing_child.gender or 'M',
+            'latitude': missing_child.last_seen_lat or 0,
+            'longitude': missing_child.last_seen_lng or 0,
+            # Use reported hour as a best-effort abduction_time if available
+            'abduction_time': (missing_child.date_reported.hour if missing_child.date_reported else 12),
+            'abductor_relation': '',
+            'region_type': '',
+            'population_density': 0,
+        }
+
+        # Compute dist_to_nearest_city similar to other code paths
+        CITY_CENTERS = {'Mumbai':(19.0761,72.8775),'Pune':(18.5203,73.8567),'Nagpur':(21.1497,79.0806),'Nashik':(19.9975,73.7898)}
+        try:
+            lat = float(case_input.get('latitude', 0))
+            lon = float(case_input.get('longitude', 0))
+            case_input['dist_to_nearest_city'] = min([haversine(lat, lon, c_lat, c_lon) for c_lat, c_lon in CITY_CENTERS.values()]) if CITY_CENTERS else 0
+        except Exception:
+            case_input['dist_to_nearest_city'] = 0
+
+        # Prepare sightings list expected by predictor.refine_location_with_sightings
+        sighting_dicts = []
+        for s in sightings:
+            sighting_dicts.append({
+                'lat': s.latitude or 0,
+                'lon': s.longitude or 0,
+                'hours_since': (datetime.utcnow() - s.sighting_time).total_seconds() / 3600,
+                'direction_text': s.description or ''
+            })
+
+        # Call model
+        ml_prediction = predict_initial_case(case_input)
+        # Only attempt refinement if there are sighting reports
+        if sighting_dicts:
+            rlat, rlon = refine_location_with_sightings(ml_prediction, sighting_dicts, case_input)
+            ml_refined = {'lat': rlat, 'lon': rlon}
+    except Exception as e:
+        # Don't raise for admin view; log and continue without ML
+        print(f"ML integration skipped for case {report_id}: {e}")
+
     return render_template('admin/case_detail.html', 
                          child=missing_child, 
                          sightings=sightings,
-                         heat_data=json.dumps(heat_data))
+                         heat_data=json.dumps(heat_data),
+                         ml_prediction=ml_prediction,
+                         ml_refined=ml_refined)
 
 @app.route('/admin/update_status/<report_id>/<status>')
 @login_required
@@ -1235,6 +1286,85 @@ def internal_error(error):
 @app.route('/health')
 def health_check():
     return jsonify({'status': 'healthy', 'timestamp': datetime.utcnow().isoformat()})
+
+
+@app.route('/ml')
+def ml_page():
+    """Render a simple ML prediction UI integrated into the main site.
+
+    The form uses JavaScript to call `/api/ml/predict` and `/api/ml/refine` so
+    we keep the model functions and paths intact (they live in `predictor.py`).
+    """
+    return render_template('ml.html')
+
+
+@app.route('/api/ml/predict', methods=['POST'])
+def api_ml_predict():
+    payload = request.get_json() or {}
+    try:
+        # Lazy import to avoid heavy startup cost if models are not present
+        from predictor import predict_initial_case, haversine
+    except Exception as e:
+        return jsonify({'success': False, 'error': f'Model import failed: {e}'}), 500
+
+    # Accept both form-style payloads and JSON
+    data = payload if isinstance(payload, dict) else {}
+
+    # Build case input expected by the predictor
+    case_input = {}
+    # map possible field names
+    mapping = {
+        'age': 'child_age', 'child_age': 'child_age', 'gender': 'child_gender', 'child_gender': 'child_gender',
+        'abduction_time': 'abduction_time', 'abductor_relation': 'abductor_relation', 'latitude': 'latitude', 'longitude': 'longitude',
+        'day_of_week': 'day_of_week', 'region_type': 'region_type', 'population_density': 'population_density', 'transport_hub_nearby': 'transport_hub_nearby'
+    }
+    for k, v in mapping.items():
+        if k in data:
+            case_input[v] = data[k]
+
+    # Fallbacks from query parameters if not JSON
+    if not case_input:
+        for k, v in mapping.items():
+            val = request.form.get(k)
+            if val is not None:
+                case_input[v] = val
+
+    # Compute dist_to_nearest_city used by Stage 2
+    CITY_CENTERS = {'Mumbai':(19.0761,72.8775),'Pune':(18.5203,73.8567),'Nagpur':(21.1497,79.0806),'Nashik':(19.9975,73.7898)}
+    try:
+        lat = float(case_input.get('latitude', 0))
+        lon = float(case_input.get('longitude', 0))
+        case_input['dist_to_nearest_city'] = min([haversine(lat, lon, c_lat, c_lon) for c_lat, c_lon in CITY_CENTERS.values()]) if CITY_CENTERS else 0
+    except Exception:
+        case_input['dist_to_nearest_city'] = 0
+
+    try:
+        prediction = predict_initial_case(case_input)
+        return jsonify({'success': True, 'prediction': prediction, 'case_input': case_input})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/ml/refine', methods=['POST'])
+def api_ml_refine():
+    payload = request.get_json() or {}
+    try:
+        from predictor import refine_location_with_sightings
+    except Exception as e:
+        return jsonify({'success': False, 'error': f'Model import failed: {e}'}), 500
+
+    initial_prediction = payload.get('initial_prediction')
+    sightings = payload.get('sightings', [])
+    initial_case_input = payload.get('initial_case_input', {})
+
+    if not initial_prediction or not initial_case_input:
+        return jsonify({'success': False, 'error': 'initial_prediction and initial_case_input are required'}), 400
+
+    try:
+        lat, lon = refine_location_with_sightings(initial_prediction, sightings, initial_case_input)
+        return jsonify({'success': True, 'refined_lat': lat, 'refined_lon': lon})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 # ... (keep everything above as is until the create_tables function)
 
